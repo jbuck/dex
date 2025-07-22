@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
@@ -291,51 +292,82 @@ func (c *googleConnector) createIdentity(ctx context.Context, identity connector
 // getGroups creates a connection to the admin directory service and lists
 // all groups the user is a member of
 func (c *googleConnector) getGroups(email string, fetchTransitiveGroupMembership bool, checkedGroups map[string]struct{}) ([]string, error) {
-	var userGroups []string
-	var err error
-	groupsList := &admin.Groups{}
+	var (
+		mu         sync.Mutex
+		wg         sync.WaitGroup
+		userGroups []string
+		errs       = make(chan error, 1) // buffered to avoid goroutine leaks
+	)
+
 	domain := c.extractDomainFromEmail(email)
 	adminSrv, err := c.findAdminService(domain)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("could not get admin service: %w", err)
 	}
 
-	for {
-		groupsList, err = adminSrv.Groups.List().
-			UserKey(email).PageToken(groupsList.NextPageToken).Do()
-		if err != nil {
-			return nil, fmt.Errorf("could not list groups: %v", err)
+	// mutex-protected wrapper for checking and adding to checkedGroups
+	addGroupIfNotChecked := func(groupEmail string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if _, exists := checkedGroups[groupEmail]; exists {
+			return false
 		}
+		checkedGroups[groupEmail] = struct{}{}
+		return true
+	}
 
-		for _, group := range groupsList.Groups {
-			if _, exists := checkedGroups[group.Email]; exists {
-				continue
-			}
+	var fetch func(string)
+	fetch = func(userOrGroupEmail string) {
+		defer wg.Done()
 
-			checkedGroups[group.Email] = struct{}{}
-			// TODO (joelspeed): Make desired group key configurable
-			userGroups = append(userGroups, group.Email)
-
-			if !fetchTransitiveGroupMembership {
-				continue
-			}
-
-			// getGroups takes a user's email/alias as well as a group's email/alias
-			transitiveGroups, err := c.getGroups(group.Email, fetchTransitiveGroupMembership, checkedGroups)
+		var nextPageToken string
+		for {
+			groupsList, err := adminSrv.Groups.List().UserKey(userOrGroupEmail).PageToken(nextPageToken).Do()
 			if err != nil {
-				return nil, fmt.Errorf("could not list transitive groups: %v", err)
+				select {
+				case errs <- fmt.Errorf("could not list groups for %s: %w", userOrGroupEmail, err):
+				default:
+				}
+				return
 			}
 
-			userGroups = append(userGroups, transitiveGroups...)
-		}
+			for _, group := range groupsList.Groups {
+				if !addGroupIfNotChecked(group.Email) {
+					continue
+				}
 
-		if groupsList.NextPageToken == "" {
-			break
+				mu.Lock()
+				userGroups = append(userGroups, group.Email)
+				mu.Unlock()
+
+				if fetchTransitiveGroupMembership {
+					wg.Add(1)
+					go fetch(group.Email)
+				}
+			}
+
+			if groupsList.NextPageToken == "" {
+				break
+			}
+			nextPageToken = groupsList.NextPageToken
 		}
 	}
 
-	return userGroups, nil
+	// start fetching with the user's email
+	wg.Add(1)
+	go fetch(email)
+
+	// wait for all goroutines to finish
+	wg.Wait()
+
+	select {
+	case err := <-errs:
+		return nil, err
+	default:
+		return userGroups, nil
+	}
 }
+
 
 func (c *googleConnector) findAdminService(domain string) (*admin.Service, error) {
 	adminSrv, ok := c.adminSrv[domain]
